@@ -2,22 +2,22 @@
 """
 from beets.autotag.hooks import AlbumInfo, TrackInfo, Distance
 from beets.plugins import BeetsPlugin
+from six.moves import urllib
 import sys
-import logging
 import requests
 import re
 
-log = logging.getLogger('beets')
+LANG_MAP = { 'ja': 'Japanese', 'ja-latn': 'Romaji', 'en': 'English' }
+
 
 class VGMdbPlugin(BeetsPlugin):
-
     def __init__(self):
         super(VGMdbPlugin, self).__init__()
         self.config.add({
             'source_weight': 1.0,
-            'lang-priority': 'en, ja-latn'
+            'lang-priority': 'ja, en, ja-latn'
         })
-        log.debug('Querying VGMdb')
+        self._log.debug('Querying VGMdb')
         self.source_weight = self.config['source_weight'].as_number()
         self.lang = self.config['lang-priority'].get().split(",")
 
@@ -33,21 +33,23 @@ class VGMdbPlugin(BeetsPlugin):
         """Returns a list of AlbumInfo objects for VGMdb search results
         matching an album and artist (if not various).
         """
-        if va_likely:
-            query = album
-        else:
-            query = '%s %s' % (artist, album)
         try:
-            return self.get_albums(query, va_likely)
+            return self.get_albums(album, va_likely)
         except:
-            log.debug('VGMdb Search Error: (query: %s)' % query)
+            self._log.debug('VGMdb Search Error: (query: %s)' % query)
             return []
 
     def album_for_id(self, album_id):
         """Fetches an album by its VGMdb ID and returns an AlbumInfo object
         or None if the album is not found.
         """
-        log.debug('Querying VGMdb for release %s' % str(album_id))
+        id = album_id.split(':')
+        if len(id) > 1 and 'vgmdb' not in id:
+            return
+        elif len(id) > 1 and 'vgmdb' in id:
+            album_id = id[1]
+
+        self._log.debug('Querying VGMdb for release %s' % str(album_id))
 
         # Get from VGMdb
         r = requests.get('http://vgmdb.info/album/%s?format=json' % str(album_id))
@@ -56,7 +58,7 @@ class VGMdbPlugin(BeetsPlugin):
         try:
             item = r.json()
         except:
-            log.debug('VGMdb JSON Decode Error: (id: %s)' % album_id)
+            self._log.debug('VGMdb JSON Decode Error: (id: %s)' % album_id)
             return None
 
         return self.get_album_info(item, False)
@@ -74,76 +76,73 @@ class VGMdbPlugin(BeetsPlugin):
         query = re.sub(r'(?i)\b(CD|disc)\s*\d+', '', query)
 
         # Query VGMdb
-        r = requests.get('http://vgmdb.info/search/albums/%s?format=json' % query)
-        albums = []
+        r = requests.get('http://vgmdb.info/search/albums/%s?format=json' % urllib.parse.quote(query.encode('utf-8')))
 
         # Decode Response's content
         try:
             items = r.json()
         except:
-            log.debug('VGMdb JSON Decode Error: (query: %s)' % query)
-            return albums
+            self._log.debug('VGMdb JSON Decode Error: (query: %s)' % query)
+            return []
 
         # Break up and get search results
-        for item in items["results"]["albums"]:
-            album_id = str(self.decod(item["link"][6:]))
-            albums.append(self.album_for_id(album_id))
-            if len(albums) >= 5:
-                break
-        log.debug('get_albums Querying VGMdb for release %s' % str(query))
-        return albums
 
-    def decod(self, val, codec='utf8'):
-        """Ensure that all string are coded to Unicode.
-        """
-        if isinstance(val, basestring):
-            return val.decode(codec, 'ignore')
+        return [self.album_for_id(item["link"].split('/')[-1])
+                for item in items["results"]["albums"]]
 
     def get_album_info(self, item, va_likely):
         """Convert json data into a format beets can read
         """
-
         # If a preferred lang is available use that instead
         album_name = item["name"]
         for lang in self.lang:
-            if item["names"].has_key(lang):
+            if lang in item["names"]:
                 album_name = item["names"][lang]
+                break
 
-        album_id = item["link"][6:]
-        country = "JP"
+        album_id = int(item["link"].split('/')[-1])
         catalognum = item["catalog"]
 
         # Get Artist information
-        if item.has_key("performers") and len(item["performers"]) > 0:
+        if "performers" in item and item["performers"] and not len(item["performers"]) > 1:
             artist_type = "performers"
+        elif "organizations" in item and item["organizations"]:
+            artist_type = "organizations"
         else:
             artist_type = "composers"
 
         artists = []
         for artist in item[artist_type]:
-            if artist["names"].has_key(self.lang[0]):
-                artists.append(artist["names"][self.lang[0]])
-            else:
-                artists.append(artist["names"]["ja"])
+            a = ''
+            for lang in self.lang:
+                if lang in artist["names"]:
+                    a = artist["names"][lang]
+                    break
+            if not a:
+                a = artist["names"].itervalues().next()
+            artists.append(a)
 
         artist = artists[0]
-        if item[artist_type][0].has_key("link"):
-            artist_id = item[artist_type][0]["link"][7:]
+
+        if "link" in item[artist_type][0]:
+            artist_id = item[artist_type][0]["link"].split('/')[-1]
         else:
             artist_id = None
 
         # Get Track metadata
-        Tracks = []
+        tracks = []
         total_index = 0
         for disc_index, disc in enumerate(item["discs"]):
             for track_index, track in enumerate(disc["tracks"]):
                 total_index += 1
 
-                if track["names"].has_key("English"):
-                    title = track["names"]["English"]
-                elif track["names"].has_key("Romaji"):
-                    title = track["names"]["Romaji"]
-                else:
+                title = None
+                for lang in self.lang:
+                    if lang in LANG_MAP and LANG_MAP[lang] in track["names"]:
+                        title = track["names"][LANG_MAP[lang]]
+                        break
+
+                if not title:
                     title = track["names"].values()[0]
 
                 index = total_index
@@ -155,51 +154,38 @@ class VGMdbPlugin(BeetsPlugin):
                     length = (float(length[0]) * 60) + float(length[1])
 
                 media = item["media_format"]
-                medium = disc_index
-                medium_index = track_index
-                new_track = TrackInfo(
-                    title,
-                    int(index),
-                    length=float(length),
-                    index=int(index),
-                    medium=int(medium),
-                    medium_index=int(medium_index),
-                    medium_total=item["discs"].count
-                    )
-                Tracks.append(new_track)
+                medium = disc_index + 1
+                medium_index = track_index + 1
+                new_track = TrackInfo(title, index, length=length, index=index,
+                                      medium=medium, medium_index=medium_index,
+                                      medium_total=len(item["discs"])
+                )
+                tracks.append(new_track)
 
         # Format Album release date
         release_date = item["release_date"].split("-")
-        year  = release_date[0]
-        month = release_date[1]
-        day   = release_date[2]
+        year  = int(release_date[0])
+        month = int(release_date[1])
+        day   = int(release_date[2])
 
-        if item["publisher"]["names"].has_key(self.lang[0]):
-            label = item["publisher"]["names"][self.lang[0]]
-        else:
-            label = item["publisher"]["names"]["ja"]
+
+        label = None
+        for lang in self.lang:
+            if lang in item["publisher"]["names"]:
+                label = item["publisher"]["names"][lang]
+
+        if not label:
+            label = item["publisher"]["names"].itervalues().next()
 
         mediums = len(item["discs"])
         media = item["media_format"]
 
         data_url = item["vgmdb_link"]
 
-        return AlbumInfo(album_name,
-                        self.decod(album_id),
-                        artist,
-                        self.decod(artist_id),
-                        Tracks,
-                        asin=None,
-                        albumtype=None,
-                        va=False,
-                        year=int(year),
-                        month=int(month),
-                        day=int(day),
-                        label=label,
-                        mediums=int(mediums),
-                        media=self.decod(media),
-                        data_source=self.decod('VGMdb'),
-                        data_url=self.decod(data_url),
-                        country=self.decod(country),
-                        catalognum=self.decod(catalognum)
-                     )
+        return AlbumInfo(album_name, album_id,
+                         artist, artist_id, tracks,
+                         va=False, catalognum=catalognum,
+                         year=year, month=month, day=day,
+                         label=label, mediums=mediums, media=media,
+                         data_source='VGMdb', data_url=data_url,
+                         script='utf-8')
